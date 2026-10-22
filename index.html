@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Invisibility Cloak</title>
+<style>
+  /* ---------- Basic page styling ---------- */
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #000;
+    overflow: hidden;
+    font-family: system-ui, sans-serif;
+  }
+
+  /* The canvas is what we actually SHOW to the user.
+     The <video> element itself stays invisible - we only use it
+     as a data source (both for drawing frames and for hand detection). */
+  #outputCanvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    display: block;
+  }
+
+  video {
+    display: none; /* we never show the raw <video>, only the canvas */
+  }
+
+  /* Floating UI: retake-snapshot button + status text */
+  #ui {
+    position: absolute;
+    bottom: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 10;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+  }
+
+  #retakeBtn {
+    padding: 12px 22px;
+    font-size: 16px;
+    border: none;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.85);
+    cursor: pointer;
+    font-weight: 600;
+  }
+  #retakeBtn:hover { background: #fff; }
+
+  #status {
+    color: #fff;
+    background: rgba(0, 0, 0, 0.5);
+    padding: 4px 10px;
+    border-radius: 6px;
+    font-size: 13px;
+  }
+
+  /* Large centered countdown overlay, shown only while capturing the
+     background snapshot. Hidden the rest of the time. */
+  #countdownOverlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 20;
+    display: none; /* toggled to "flex" via JS while counting down */
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    background: rgba(0, 0, 0, 0.55);
+    color: #fff;
+  }
+
+  #countdownMessage {
+    font-size: 28px;
+    font-weight: 600;
+    max-width: 80%;
+    margin-bottom: 20px;
+    text-shadow: 0 2px 8px rgba(0, 0, 0, 0.8);
+  }
+
+  #countdownNumber {
+    font-size: 160px;
+    font-weight: 800;
+    line-height: 1;
+    text-shadow: 0 4px 16px rgba(0, 0, 0, 0.8);
+  }
+</style>
+</head>
+<body>
+
+  <!-- Hidden video element: source of the live camera stream -->
+  <video id="video" autoplay playsinline muted></video>
+
+  <!-- Visible canvas: everything the user sees is drawn here -->
+  <canvas id="outputCanvas"></canvas>
+
+  <!-- Large countdown overlay, shown only while capturing a background snapshot -->
+  <div id="countdownOverlay">
+    <div id="countdownMessage">Step out of the frame!<br />Capturing the empty background...</div>
+    <div id="countdownNumber">3</div>
+  </div>
+
+  <!-- Simple UI overlay -->
+  <div id="ui">
+    <div id="status">Loading hand tracker...</div>
+    <button id="retakeBtn">Retake Background Snapshot</button>
+  </div>
+
+<!--
+  We load MediaPipe's "tasks-vision" package as an ES module directly from a
+  CDN (jsDelivr). This gives us HandLandmarker, a ready-made hand-tracking
+  model that runs entirely in the browser (WASM), no server needed.
+-->
+<script type="module">
+  import {
+    HandLandmarker,
+    FilesetResolver
+  } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+  // ---------- Grab DOM elements ----------
+  const video = document.getElementById("video");
+  const canvas = document.getElementById("outputCanvas");
+  const ctx = canvas.getContext("2d");
+  const statusEl = document.getElementById("status");
+  const retakeBtn = document.getElementById("retakeBtn");
+  const countdownOverlay = document.getElementById("countdownOverlay");
+  const countdownMessage = document.getElementById("countdownMessage");
+  const countdownNumber = document.getElementById("countdownNumber");
+
+  // Offscreen canvas that stores our "empty room" background snapshot.
+  // We keep it completely separate from the visible canvas so we can
+  // freely redraw the live frame each animation tick without touching it.
+  const snapshotCanvas = document.createElement("canvas");
+  const snapshotCtx = snapshotCanvas.getContext("2d");
+  let haveSnapshot = false;
+
+  let handLandmarker = null;
+  let lastVideoTime = -1; // used to avoid re-running detection on the same frame
+
+  // ------------------------------------------------------------------
+  // STEP 1: Start the webcam and stream it full-screen (mirrored)
+  // ------------------------------------------------------------------
+  async function startCamera() {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 1280, height: 720 },
+      audio: false
+    });
+    video.srcObject = stream;
+
+    // Wait for the video's real dimensions to be known, then size our
+    // canvases to match so pixel coordinates line up 1:1.
+    await new Promise((resolve) => {
+      video.onloadedmetadata = () => {
+        video.play();
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        snapshotCanvas.width = video.videoWidth;
+        snapshotCanvas.height = video.videoHeight;
+        resolve();
+      };
+    });
+  }
+
+  // ------------------------------------------------------------------
+  // Draw the CURRENT camera frame onto a given 2D context, mirrored
+  // left-right (like a selfie camera). We reuse this exact function for
+  // both the live canvas AND for taking the background snapshot, so the
+  // pixel coordinates always match between the two.
+  // ------------------------------------------------------------------
+  function drawMirroredVideoFrame(targetCtx) {
+    targetCtx.save();
+    // Flip horizontally: scale x by -1, then shift back into view.
+    targetCtx.scale(-1, 1);
+    targetCtx.translate(-canvas.width, 0);
+    targetCtx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    targetCtx.restore();
+  }
+
+  // ------------------------------------------------------------------
+  // STEP 4 (part A): Take a snapshot of the "empty room" background.
+  // Called once automatically when the stream starts, and again anytime
+  // the user clicks "Retake Background Snapshot".
+  // ------------------------------------------------------------------
+  function takeSnapshot() {
+    drawMirroredVideoFrame(snapshotCtx);
+    haveSnapshot = true;
+    statusEl.textContent = "Background snapshot captured!";
+  }
+
+  // ------------------------------------------------------------------
+  // Countdown wrapper around takeSnapshot(). This gives you time to
+  // physically step OUT of the camera's view before the "empty room"
+  // photo is actually taken, instead of instantly snapshotting whatever
+  // happens to be in frame right now (which would bake YOU into the
+  // background and break the cloak effect).
+  // ------------------------------------------------------------------
+  function takeSnapshotWithCountdown(seconds = 3) {
+    retakeBtn.disabled = true; // prevent overlapping countdowns
+    let remaining = seconds;
+
+    // Show the big full-screen overlay with instructions + large number.
+    countdownMessage.textContent =
+      "Step out of the camera's view so we can capture an empty background.";
+    countdownNumber.textContent = remaining;
+    countdownOverlay.style.display = "flex";
+    statusEl.textContent = "Capturing background snapshot...";
+
+    const intervalId = setInterval(() => {
+      remaining--;
+      if (remaining > 0) {
+        countdownNumber.textContent = remaining;
+      } else {
+        clearInterval(intervalId);
+        takeSnapshot();
+        countdownOverlay.style.display = "none"; // hide overlay once captured
+        retakeBtn.disabled = false;
+      }
+    }, 1000);
+  }
+  retakeBtn.addEventListener("click", () => takeSnapshotWithCountdown(7));
+
+  // ------------------------------------------------------------------
+  // STEP 2: Load MediaPipe's HandLandmarker model (runs locally in-browser)
+  // ------------------------------------------------------------------
+  async function setupHandLandmarker() {
+    // FilesetResolver locates the WASM binaries the model needs to run.
+    const vision = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+    );
+
+    handLandmarker = await HandLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath:
+          "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        delegate: "GPU" // fall back to CPU automatically if GPU isn't available
+      },
+      runningMode: "VIDEO",
+      numHands: 2 // we only care about up to two hands
+    });
+  }
+
+  // ------------------------------------------------------------------
+  // Helper: given 4 points (2 index tips + 2 thumb tips), sort them into
+  // a proper polygon order (e.g. going around clockwise) so that when we
+  // connect them with lines we get a simple, non-self-crossing quad
+  // instead of a "bowtie" shape.
+  // ------------------------------------------------------------------
+  function orderPointsAsPolygon(points) {
+    // Find the centroid (average x/y) of all 4 points.
+    const cx = points.reduce((sum, p) => sum + p.x, 0) / points.length;
+    const cy = points.reduce((sum, p) => sum + p.y, 0) / points.length;
+
+    // Sort points by their angle around the centroid. Walking through
+    // points in increasing angle order traces the polygon's outline
+    // without any crossing lines.
+    return points
+      .map((p) => ({ ...p, angle: Math.atan2(p.y - cy, p.x - cx) }))
+      .sort((a, b) => a.angle - b.angle);
+  }
+
+  // ------------------------------------------------------------------
+  // Smoothing: fast hand motion makes the raw fingertip landmarks jitter
+  // from frame to frame, which makes the polygon flicker/shake. To fix
+  // this we keep a "smoothed" copy of the 4 points and, each frame, nudge
+  // it partway toward the new raw points (an Exponential Moving Average)
+  // instead of jumping straight to them. This trades a tiny bit of lag
+  // for a much steadier-looking cloak.
+  // ------------------------------------------------------------------
+  let smoothedPoints = null; // holds the last smoothed {x, y} for each of the 4 points
+
+  // Lower = smoother but laggier, higher = snappier but jitterier.
+  const SMOOTHING_FACTOR = 0.25;
+
+  function smoothPoints(rawPoints) {
+    // First time we see points: just adopt them as-is, nothing to smooth yet.
+    if (!smoothedPoints) {
+      smoothedPoints = rawPoints.map((p) => ({ x: p.x, y: p.y }));
+      return smoothedPoints;
+    }
+
+    // Raw points can arrive in a different order each frame (MediaPipe
+    // doesn't guarantee which hand is "first"). To smooth correctly we
+    // must match each raw point to whichever *previous* smoothed point
+    // it's closest to - otherwise we'd blend unrelated fingertips together.
+    const usedRaw = new Set();
+    const newSmoothed = [];
+
+    for (const prev of smoothedPoints) {
+      let closestIndex = -1;
+      let closestDist = Infinity;
+
+      rawPoints.forEach((raw, i) => {
+        if (usedRaw.has(i)) return; // already matched to another previous point
+        const dist = Math.hypot(raw.x - prev.x, raw.y - prev.y);
+        if (dist < closestDist) {
+          closestDist = dist;
+          closestIndex = i;
+        }
+      });
+
+      if (closestIndex !== -1) {
+        usedRaw.add(closestIndex);
+        const raw = rawPoints[closestIndex];
+        // Exponential Moving Average: move partway from the old smoothed
+        // position toward the new raw position.
+        newSmoothed.push({
+          x: prev.x + (raw.x - prev.x) * SMOOTHING_FACTOR,
+          y: prev.y + (raw.y - prev.y) * SMOOTHING_FACTOR
+        });
+      }
+    }
+
+    smoothedPoints = newSmoothed;
+    return smoothedPoints;
+  }
+
+  // Holds the most recent valid polygon so we can keep drawing the cloak
+  // even on animation-frame ticks where no *new* camera frame arrived yet
+  // (the screen refreshes faster than the camera in some browsers - without
+  // this, the cloak would blink off every other tick).
+  let currentPolygon = null;
+
+  // ------------------------------------------------------------------
+  // STEP 3 + 4 (part B): Main render loop.
+  // Every animation frame we:
+  //   1. Draw the live mirrored camera feed onto the visible canvas.
+  //   2. Run hand detection on the raw video (only when a fresh frame exists).
+  //   3. If both hands are visible, build a smoothed 4-point polygon from
+  //      the index-finger tips (landmark 8) and thumb tips (landmark 4).
+  //   4. Every tick, clip the canvas to the latest known polygon and paint
+  //      the matching region of our saved background snapshot on top,
+  //      "erasing" whatever is inside the polygon in the live frame.
+  // ------------------------------------------------------------------
+  function renderLoop() {
+    // 1. Draw the current live frame (mirrored) as the base image.
+    drawMirroredVideoFrame(ctx);
+
+    // 2. Run hand detection only when a new video frame is actually available.
+    if (handLandmarker && video.currentTime !== lastVideoTime) {
+      lastVideoTime = video.currentTime;
+      const nowMs = performance.now();
+      const results = handLandmarker.detectForVideo(video, nowMs);
+
+      if (results.landmarks && results.landmarks.length === 2) {
+        // Two hands detected! Pull out index-tip (8) and thumb-tip (4)
+        // from each hand's landmark list.
+        const points = [];
+        for (const handLandmarks of results.landmarks) {
+          const indexTip = handLandmarks[8];
+          const thumbTip = handLandmarks[4];
+
+          // Landmarks are normalized [0,1] relative to the RAW (unmirrored)
+          // video frame. Since we render everything mirrored, we flip the
+          // x-coordinate here: mirroredX = (1 - normalizedX) * width.
+          points.push({
+            x: (1 - indexTip.x) * canvas.width,
+            y: indexTip.y * canvas.height
+          });
+          points.push({
+            x: (1 - thumbTip.x) * canvas.width,
+            y: thumbTip.y * canvas.height
+          });
+        }
+
+        // 2.5 Smooth the raw points over the last few frames so fast hand
+        //     movement doesn't make the polygon flicker/shake.
+        const smoothed = smoothPoints(points);
+
+        // 3. Order the (smoothed) 4 points so they form a clean polygon
+        //    outline, and remember it as our latest known-good polygon.
+        currentPolygon = orderPointsAsPolygon(smoothed);
+
+        statusEl.textContent = "Both hands detected - cloak active";
+      } else {
+        // Hands aren't both visible on this frame - remove the cloak
+        // immediately (no grace period) and clear the smoothing history
+        // so that when hands reappear we don't smear toward a stale
+        // position from before they left the frame.
+        currentPolygon = null;
+        smoothedPoints = null;
+        statusEl.textContent = "Show both hands (thumb + index finger) to activate cloak";
+      }
+    }
+
+    // 4. Draw the cloak using the latest known polygon EVERY tick (not just
+    //    on ticks where a fresh detection ran). This keeps the effect
+    //    perfectly steady even if the render loop runs faster than the
+    //    camera/model can supply new frames.
+    if (currentPolygon && haveSnapshot) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(currentPolygon[0].x, currentPolygon[0].y);
+      for (let i = 1; i < currentPolygon.length; i++) {
+        ctx.lineTo(currentPolygon[i].x, currentPolygon[i].y);
+      }
+      ctx.closePath();
+      ctx.clip(); // restrict all further drawing to inside the polygon
+
+      // Draw the saved background over the entire canvas - only the
+      // clipped (polygon) region actually ends up visible.
+      ctx.drawImage(snapshotCanvas, 0, 0, canvas.width, canvas.height);
+
+      ctx.restore(); // remove the clip for the next frame
+    }
+
+    requestAnimationFrame(renderLoop);
+  }
+
+  // ------------------------------------------------------------------
+  // Boot sequence: start camera -> take initial snapshot -> load model -> render
+  // ------------------------------------------------------------------
+  async function main() {
+    statusEl.textContent = "Requesting camera access...";
+    await startCamera();
+
+    // STEP 4: Grab the "empty room" snapshot after a short countdown, so
+    // you have time to step out of frame before it's captured (instead of
+    // instantly snapshotting you standing right where the camera opened).
+    // We also start loading the hand-tracking model at the same time (it
+    // doesn't touch statusEl, so it won't interrupt the countdown text).
+    const modelLoadingPromise = setupHandLandmarker();
+    takeSnapshotWithCountdown(7);
+
+    // Wait for both the countdown/snapshot AND the model to finish before
+    // declaring the app "ready".
+    await modelLoadingPromise;
+    while (!haveSnapshot) {
+      await new Promise((r) => setTimeout(r, 200));
+    }
+
+    statusEl.textContent = "Ready! Show both hands to activate the cloak.";
+    renderLoop();
+  }
+
+  main().catch((err) => {
+    console.error(err);
+    statusEl.textContent = "Error: " + err.message;
+  });
+</script>
+</body>
+</html>
